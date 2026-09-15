@@ -398,6 +398,157 @@ def check_validation_codes() -> None:
     _expect_422(payload=[1, 2, 3], want_detail="INVALID_PAYLOAD")
 
 
+def check_alternatives_unique_optimum_gap() -> None:
+    body = _align(
+        {
+            "planned": [{"code": "A", "at_ms": 0}],
+            "actual": [{"code": "A", "at_ms": 100}],
+            "alternative_limit": 1,
+        }
+    )
+    _expect_equal("unique optimum top cost", body["total_cost"], 100)
+    _expect_equal(
+        "unique optimum keys append alternatives last",
+        list(body),
+        ["compliant", "total_cost", "pairs", "first_defect", "alternatives"],
+    )
+    _expect_equal("unique optimum alternative count", len(body["alternatives"]), 1)
+    alternative = body["alternatives"][0]
+    _expect_equal(
+        "unique optimum alternative keys",
+        list(alternative),
+        [
+            "total_cost",
+            "cost_gap",
+            "pairs",
+            "compliant",
+            "first_defect",
+            "first_divergence_index",
+        ],
+    )
+    _expect_equal(
+        "runner-up ops", [p["op"] for p in alternative["pairs"]], ["DELETE", "INSERT"]
+    )
+    _expect_equal("runner-up total cost", alternative["total_cost"], 5000)
+    _expect_equal("runner-up positive gap", alternative["cost_gap"], 4900)
+    if alternative["cost_gap"] <= 0:
+        raise CheckFailed("unique optimum must have a positive cost gap")
+    _expect_equal("runner-up divergence", alternative["first_divergence_index"], 0)
+    _expect_equal("runner-up compliance", alternative["compliant"], False)
+    _expect_equal(
+        "runner-up first defect", alternative["first_defect"]["code"], "MISS"
+    )
+
+
+def check_alternatives_duplicate_code_fork() -> None:
+    body = _align(
+        {
+            "planned": [
+                {"code": "A", "at_ms": 0},
+                {"code": "A", "at_ms": 1000},
+            ],
+            "actual": [{"code": "A", "at_ms": 500}],
+            "alternative_limit": 1,
+        }
+    )
+    _expect_equal(
+        "duplicate code preferred ops",
+        [p["op"] for p in body["pairs"]],
+        ["MATCH", "DELETE"],
+    )
+    _expect_equal("duplicate code alternative count", len(body["alternatives"]), 1)
+    alternative = body["alternatives"][0]
+    _expect_equal(
+        "duplicate code fork ops",
+        [p["op"] for p in alternative["pairs"]],
+        ["DELETE", "MATCH"],
+    )
+    _expect_equal("duplicate code fork total", alternative["total_cost"], 3000)
+    _expect_equal("duplicate code fork gap", alternative["cost_gap"], 0)
+    _expect_equal(
+        "duplicate code fork divergence", alternative["first_divergence_index"], 0
+    )
+    _expect_equal(
+        "fork match uses later planned copy",
+        alternative["pairs"][1]["planned_index"],
+        1,
+    )
+
+
+def check_alternatives_shortage() -> None:
+    body = _align({"planned": [], "actual": [], "alternative_limit": 20})
+    _expect_equal("empty sequences alternatives", body["alternatives"], [])
+    body = _align(
+        {
+            "planned": [{"code": "A", "at_ms": 0}],
+            "actual": [{"code": "A", "at_ms": 0}],
+            "alternative_limit": 20,
+        }
+    )
+    # MATCH, DELETE+INSERT and INSERT+DELETE are all the legal paths.
+    _expect_equal("fewer paths than limit returns actual count",
+                  len(body["alternatives"]), 2)
+    paths = [tuple(p["op"] for p in body["pairs"])]
+    paths += [
+        tuple(p["op"] for p in alternative["pairs"])
+        for alternative in body["alternatives"]
+    ]
+    if len(set(paths)) != len(paths):
+        raise CheckFailed(f"duplicate alternative paths: {paths}")
+    gaps = [alternative["cost_gap"] for alternative in body["alternatives"]]
+    _expect_equal("gaps sorted relative to preferred", gaps, sorted(gaps))
+
+
+def check_alternatives_legacy_byte_compatibility() -> None:
+    raw = json.dumps(
+        {
+            "planned": [
+                {"code": "A", "at_ms": 0},
+                {"code": "B", "at_ms": 1000},
+            ],
+            "actual": [{"code": "A", "at_ms": 100}],
+        }
+    ).encode("utf-8")
+
+    def raw_align() -> bytes:
+        req = urllib.request.Request(
+            BASE_URL + "/align",
+            data=raw,
+            method="POST",
+            headers={"Content-Type": "application/json"},
+        )
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            if resp.status != 200:
+                raise CheckFailed(f"expected 200, got {resp.status}")
+            return resp.read()
+
+    text = raw_align()
+    if b"alternatives" in text:
+        raise CheckFailed("legacy response must not contain alternatives")
+    for _ in range(2):
+        if raw_align() != text:
+            raise CheckFailed("legacy responses must be byte identical")
+
+
+def check_alternative_limit_validation() -> None:
+    for bad in (0, 21, -5, True, 1.5, "3", None):
+        codes = _expect_422(
+            {"planned": [], "actual": [], "alternative_limit": bad},
+            want_detail="INVALID_ALTERNATIVE_LIMIT",
+        )
+        _expect_equal(f"limit {bad!r} single code", codes,
+                      ["INVALID_ALTERNATIVE_LIMIT"])
+    # Boundaries are accepted.
+    for value in (1, 20):
+        status, body = _request(
+            "POST",
+            "/align",
+            payload={"planned": [], "actual": [], "alternative_limit": value},
+        )
+        _expect_equal(f"limit {value} status", status, 200)
+        _expect_equal(f"limit {value} alternatives", body["alternatives"], [])
+
+
 CHECKS = [
     ("health", check_health),
     ("compliant exact replay", check_compliant_exact),
@@ -412,6 +563,14 @@ CHECKS = [
     ("first defect is leftmost", check_first_defect_is_leftmost),
     ("empty arrays", check_empty_arrays),
     ("determinism across calls", check_determinism),
+    ("alternatives unique optimum positive gap",
+     check_alternatives_unique_optimum_gap),
+    ("alternatives duplicate code zero-gap fork",
+     check_alternatives_duplicate_code_fork),
+    ("alternatives shortage returns real count", check_alternatives_shortage),
+    ("alternatives legacy byte compatibility",
+     check_alternatives_legacy_byte_compatibility),
+    ("alternative_limit validation codes", check_alternative_limit_validation),
     ("validation machine codes", check_validation_codes),
 ]
 

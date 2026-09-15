@@ -255,3 +255,209 @@ def test_422_collects_multiple_details(client):
     )
     paths = [d["path"] for d in body["error"]["details"]]
     assert paths == ["planned[0].code", "planned[1].at_ms", "actual[0].at_ms"]
+
+
+# --- alternative_limit ----------------------------------------------------
+
+
+def test_omitted_alternative_limit_response_is_unchanged(client):
+    payload = {
+        "planned": [{"code": "A", "at_ms": 0}, {"code": "A", "at_ms": 1000}],
+        "actual": [{"code": "A", "at_ms": 500}],
+    }
+    body = post(client, payload)
+    assert body.status_code == 200
+    assert "alternatives" not in body.json()
+    # Byte-for-byte identical to an explicit legacy-style repetition, and the
+    # top-level key order keeps first_defect last.
+    assert body.json() == {
+        "compliant": False,
+        "total_cost": 3000,
+        "pairs": [
+            {
+                "op": "MATCH",
+                "cost": 500,
+                "code": "A",
+                "planned_index": 0,
+                "actual_index": 0,
+                "planned_at_ms": 0,
+                "actual_at_ms": 500,
+                "drift_ms": 500,
+            },
+            {
+                "op": "DELETE",
+                "cost": 2500,
+                "code": "A",
+                "planned_index": 1,
+                "planned_at_ms": 1000,
+            },
+        ],
+        "first_defect": {
+            "code": "MISS",
+            "pair_index": 1,
+            "pair": {
+                "op": "DELETE",
+                "cost": 2500,
+                "code": "A",
+                "planned_index": 1,
+                "planned_at_ms": 1000,
+            },
+        },
+    }
+    text = body.text
+    assert list(body.json()) == ["compliant", "total_cost", "pairs", "first_defect"]
+    assert text.index("pairs") < text.index("first_defect")
+    assert "alternatives" not in text
+    assert post(client, payload).text == text
+
+
+def test_alternatives_shape_and_content(client):
+    payload = {
+        "planned": [{"code": "A", "at_ms": 0}, {"code": "A", "at_ms": 1000}],
+        "actual": [{"code": "A", "at_ms": 500}],
+        "alternative_limit": 1,
+    }
+    resp = post(client, payload)
+    assert resp.status_code == 200
+    body = resp.json()
+    assert list(body) == [
+        "compliant",
+        "total_cost",
+        "pairs",
+        "first_defect",
+        "alternatives",
+    ]
+    # limit=1 returns the preferred path plus its single equal-cost fork
+    # (DELETE,MATCH), even though further more expensive paths exist.
+    assert len(body["alternatives"]) == 1
+    alternative = body["alternatives"][0]
+    assert list(alternative) == [
+        "total_cost",
+        "cost_gap",
+        "pairs",
+        "compliant",
+        "first_defect",
+        "first_divergence_index",
+    ]
+    assert alternative["total_cost"] == 3000
+    assert alternative["cost_gap"] == 0
+    assert [p["op"] for p in alternative["pairs"]] == ["DELETE", "MATCH"]
+    assert alternative["pairs"][0] == {
+        "op": "DELETE",
+        "cost": 2500,
+        "code": "A",
+        "planned_index": 0,
+        "planned_at_ms": 0,
+    }
+    assert alternative["pairs"][1]["planned_index"] == 1
+    assert alternative["pairs"][1]["actual_index"] == 0
+    assert alternative["compliant"] is False
+    assert alternative["first_defect"] == {
+        "code": "MISS",
+        "pair_index": 0,
+        "pair": alternative["pairs"][0],
+    }
+    assert alternative["first_divergence_index"] == 0
+    assert post(client, payload).text == resp.text
+
+
+def test_unique_optimum_reports_positive_gap(client):
+    body = post(
+        client,
+        {
+            "planned": [{"code": "A", "at_ms": 0}],
+            "actual": [{"code": "A", "at_ms": 100}],
+            "alternative_limit": 1,
+        },
+    ).json()
+    assert body["total_cost"] == 100
+    assert len(body["alternatives"]) == 1
+    alternative = body["alternatives"][0]
+    assert [p["op"] for p in alternative["pairs"]] == ["DELETE", "INSERT"]
+    assert alternative["total_cost"] == 5000
+    assert alternative["cost_gap"] == 4900
+    assert alternative["cost_gap"] > 0
+    assert alternative["first_divergence_index"] == 0
+    assert alternative["first_defect"]["code"] == "MISS"
+
+
+def test_alternative_paths_are_unique(client):
+    body = post(
+        client,
+        {
+            "planned": [
+                {"code": "A", "at_ms": 0},
+                {"code": "A", "at_ms": 1000},
+                {"code": "A", "at_ms": 2000},
+            ],
+            "actual": [{"code": "A", "at_ms": 500}, {"code": "A", "at_ms": 1500}],
+            "alternative_limit": 20,
+        },
+    ).json()
+    paths = [tuple(pair["op"] for pair in body["pairs"])]
+    paths += [
+        tuple(pair["op"] for pair in alternative["pairs"])
+        for alternative in body["alternatives"]
+    ]
+    assert len(paths) == len(set(paths))
+    gaps = [alternative["cost_gap"] for alternative in body["alternatives"]]
+    assert gaps == sorted(gaps)
+    assert all(gap >= 0 for gap in gaps)
+
+
+def test_alternative_limit_boundaries_accepted(client):
+    payload = {"planned": [], "actual": []}
+    for value in (1, 20):
+        resp = post(client, {**payload, "alternative_limit": value})
+        assert resp.status_code == 200, value
+        assert resp.json()["alternatives"] == []
+
+
+def test_422_alternative_limit_values(client):
+    for bad in [0, 21, -1, 1.0, 1.5, "1", True, False, None, [], {}, 100]:
+        body = _assert_422(
+            post(
+                client,
+                {
+                    "planned": [],
+                    "actual": [],
+                    "alternative_limit": bad,
+                },
+            ),
+            "INVALID_ALTERNATIVE_LIMIT",
+        )
+        detail = body["error"]["details"][0]
+        assert detail["code"] == "INVALID_ALTERNATIVE_LIMIT"
+        assert detail["path"] == "alternative_limit"
+
+
+def test_422_alternative_limit_does_not_suppress_other_errors(client):
+    body = _assert_422(
+        post(
+            client,
+            {
+                "planned": "nope",
+                "actual": [],
+                "alternative_limit": 0,
+            },
+        ),
+        "INVALID_TYPE",
+        "INVALID_ALTERNATIVE_LIMIT",
+    )
+    codes = [d["code"] for d in body["error"]["details"]]
+    # Structural/field errors keep their ordering ahead of nothing: the
+    # alternative_limit detail is simply present and deterministic.
+    assert codes == ["INVALID_TYPE", "INVALID_ALTERNATIVE_LIMIT"]
+
+
+def test_alternatives_are_deterministic(client):
+    payload = {
+        "planned": [
+            {"code": "A", "at_ms": 0},
+            {"code": "B", "at_ms": 1000},
+        ],
+        "actual": [{"code": "A", "at_ms": 200}, {"code": "B", "at_ms": 3200}],
+        "alternative_limit": 10,
+    }
+    bodies = {post(client, payload).text for _ in range(3)}
+    assert len(bodies) == 1
